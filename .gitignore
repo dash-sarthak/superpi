@@ -1,0 +1,7 @@
+models/
+.venv/
+__pycache__/
+*.log
+result
+.direnv/
+tmp/
