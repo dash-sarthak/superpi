@@ -86,7 +86,7 @@ def main():
               f"| wall={rows[-1]['wall']}s | keywords missing: {g['keywords_missing']}",
               flush=True)
 
-    out = ROOT / args.runs_dir / "suite_results.json"
+    out = ROOT / args.runs_dir / f"suite_results-{args.model.replace('/', '_')}.json"
     out.write_text(json.dumps(rows, indent=2))
     done = sum(1 for r in rows if r["status"] == "done")
     correct = sum(1 for r in rows if r.get("likely_correct"))

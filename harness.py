@@ -338,7 +338,12 @@ def chat(ctx, messages):
             return json.load(response)
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:400]
+        if e.code == 500 and "parse tool call" in detail:
+            raise ToolCallParseError(detail) from e
         raise RuntimeError(f"chat HTTP {e.code}: {detail}") from e
+
+class ToolCallParseError(RuntimeError):
+    pass
 
 def echo_safe(message):
     """Strip reasoning_content before echoing an assistant message back."""
@@ -384,7 +389,15 @@ def run(args):
                     "either finish via report(), or call ask_reasoner if truly stuck."})
                 stats["nudges"] += 1
                 budget_warned = True
-            response = chat(ctx, messages)
+            try:
+                response = chat(ctx, messages)
+            except ToolCallParseError:
+                stats["server_parse_recoveries"] = stats.get("server_parse_recoveries", 0) + 1
+                log_event(ctx, {"type": "server_parse_error", "turn": turn})
+                messages.append({"role": "user", "content":
+                    "Your previous tool call was malformed or truncated (too long). "
+                    "Repeat it smaller and simpler: shorter content, one call only."})
+                response = chat(ctx, messages)
             usage = response.get("usage", {})
             stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
             stats["completion_tokens"] += usage.get("completion_tokens", 0)
@@ -466,7 +479,7 @@ def main():
     p.add_argument("--endpoint", default="http://127.0.0.1:8081")
     p.add_argument("--model", default="qwen3-1.7b")
     p.add_argument("--max-turns", type=int, default=12)
-    p.add_argument("--max-tokens-per-turn", type=int, default=1024)
+    p.add_argument("--max-tokens-per-turn", type=int, default=2048)
     p.add_argument("--reasoner-timeout", type=int, default=600)
     p.add_argument("--tool-timeout", type=int, default=30)
     p.add_argument("--temperature", type=float, default=0.6)
