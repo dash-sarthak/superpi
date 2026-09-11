@@ -15,7 +15,7 @@
           llama-cpp-cuda
           pkgs.uv
           pkgs.sqlite3
-          pkgs.jq
+          pkgs.jaq
         ];
         shellHook = ''
           echo "superpi devshell ready (llama.cpp with CUDA)"
