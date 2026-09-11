@@ -72,6 +72,29 @@ Both models ran the identical suite with the final harness config (2048-token pe
 
 **Phase 2 additions from the bench:** (6) harness-assisted report when expected artifacts exist and the model goes tool-silent for 2+ turns; (7) per-model run archives (runs/<model>/), never delete; (8) fact grading needs best-of-3 runs per task.
 
+## Addendum 2: MiniCPM5-2B bench-off (same suite, same harness)
+
+Date: 2026-09-12. Pre-registered pass criteria: (a) ≥8/10 runs done, (b) recovery within 2 turns after every rejection (dropout test, `recovery_check.py`), (c) keyword score ≥ Qwen3's 6/10.
+
+Attempt 1 (4 slots × 8K, KV q8_0, 2197 MiB): 4/10 runs ended in harness crash — `exceed_context_size_error` at 8K/slot. Not a model failure: the 2B keeps working (12–22 tool calls/task) and the harness has no overflow handling, so prompts grew to 8.2–8.9K and llama-server returned HTTP 400. Archived to `runs/minicpm5-2b-attempt1-ctxoverflow/`, never deleted. Re-run attempt 2 at 2 slots × 16K (2205 MiB):
+
+| | Qwen3-1.7B | MiniCPM5-1B | MiniCPM5-2B |
+|---|---|---|---|
+| Runs completed (status done) | 10/10 | 4/10 | 3/10 |
+| Crashes | 0 | 0 | 0 (was 4 at 8K/slot: harness gap, see below) |
+| Budget exhaustions (no_report) | 0 | 6 | 7 |
+| Keyword-graded correct | 6/10 | 2/10 | 3/10 |
+| Recovery after rejection | n/m | ~0 (total dropout) | 7/8 |
+| Wall total | ~4.6 min | ~8.4 min | ~24.9 min |
+| Tokens out | ~12.3k | ~25.6k | ~13.2k |
+| VRAM | 3187 MiB (4×8K) | 1087 MiB (4×8K) | 2197 MiB (4×8K) / 2205 MiB (2×16K) |
+
+**MiniCPM5-2B failure signature: non-convergence, not dropout.** The 1B's protocol collapse is gone (7/8 rejections recovered; the one dropout, t08 T8, came after 17 successful calls). Instead it stays in the tool protocol and loops: t10 spent all 12 turns re-searching with a wrong anchored year ("2000") and never wrote or reported; t02 re-fetched the same releases page 5× without extracting; t03 legally batched two info tools per turn and ended with two empty no-tool turns. The budget nudge at 80% was ignored. It converges only on calc-shaped tasks (t01, t05, t09 — all correct).
+
+**Verdict: FAIL on all three criteria → parked.** Scale fixes the protocol dropout but not convergence; it does not displace Qwen3 as primary and does not earn a slot over the 1B for narrow roles (2× the VRAM for +1 keyword). Kept as evidence: the dropout signature is parameter-sensitive, which validates harness-assisted convergence as the right phase-2 investment rather than model swaps.
+
+**New harness gaps found:** (9) `exceed_context_size_error` must trigger transcript compaction or graceful degradation, not a run-killing crash; (10) the 80% budget nudge needs a forced-convergence fallback (inject "write what you have now" with the artifact filename, then harness-assisted report per addition 6). Logged in `recovery_check.py` as the standing dropout metric for future candidates.
+
 ## Phase 2 implications
 
 1. Escalation to the reasoner becomes rule-based in the harness: trigger on (a) 2+ consecutive tool errors, (b) a fact stated without a fetched source, (c) any calc where the tool result was not the value written to the note.
