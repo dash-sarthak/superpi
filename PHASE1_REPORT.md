@@ -47,6 +47,31 @@ Runs: `runs/` (one directory per task, JSONL transcripts, result.json each).
 - Keyword matching passed three hallucinated notes (t03 "cuda", t06 "billion", t08 "pep").
 - Phase 2 grading needs: numeric sub-fact extraction, and fetch-and-compare of at least one cited URL per note.
 
+## Addendum: model bench-off (same suite, same harness, same config)
+
+Both models ran the identical suite with the final harness config (2048-token per-turn cap, server parse-failure recovery).
+
+| | Qwen3-1.7B | MiniCPM5-1B |
+|---|---|---|
+| Runs completed (status done) | 10/10 | 4/10 |
+| Crashes | 0 | 0 (was 4 before parse-recovery) |
+| Budget exhaustions (no_report) | 0 | 6/10 |
+| Keyword-graded correct | 6/10 | 2/10 |
+| Manually fact-checked | ~2-3/10 (high variance: t01 flipped 45W→65W between runs) | not measured (runs archived late) |
+| Wall total | ~4.6 min | ~8.4 min |
+| Tokens out | ~12.3k | ~25.6k |
+| VRAM (4 slots x 8K) | 3187 MiB | 1087 MiB |
+
+**MiniCPM5 failure signature:** after a rejection (batch guard or artifact check), it drops out of the tool protocol entirely and produces thinking-plus-plain-text turns until the budget dies (t05 trace: did the work by T5, then six consecutive tool-less turns). It does not recover; Qwen3 recovers from identical situations.
+
+**Qwen3 failure signature:** completes everything, fabricates specifics at a roughly 60-70% rate (dates, counts, PEP numbers, URLs), and even fabricates calc transcripts. Run-to-run variance on facts is high; single-run grading is noisy.
+
+**Verdict:** Qwen3-1.7B is the only viable primary for task execution today. MiniCPM5's 1.1GB footprint keeps it valuable for narrow roles without multi-step convergence (classification, summarization), and its protocol-dropout makes it a good test case for harness-assisted convergence rules.
+
+**The load-bearing conclusion:** both models fabricate at rates that make the phase-2 verification layer (verify_note, rule-based escalation) the critical path, not an enhancement. The orchestrator/reasoner tier is not optional for this hardware class.
+
+**Phase 2 additions from the bench:** (6) harness-assisted report when expected artifacts exist and the model goes tool-silent for 2+ turns; (7) per-model run archives (runs/<model>/), never delete; (8) fact grading needs best-of-3 runs per task.
+
 ## Phase 2 implications
 
 1. Escalation to the reasoner becomes rule-based in the harness: trigger on (a) 2+ consecutive tool errors, (b) a fact stated without a fetched source, (c) any calc where the tool result was not the value written to the note.
