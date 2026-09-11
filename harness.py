@@ -13,6 +13,7 @@ import re
 import socket
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -283,7 +284,9 @@ class RunComplete(Exception):
     def __init__(self, payload):
         self.payload = payload
 
-def execute_tool(ctx, name, raw_args):
+INFO_TOOLS = {"web_search", "fetch", "ask_reasoner"}
+
+def execute_tool(ctx, name, raw_args, info_seen=False):
     t0 = time.time()
     args, parse_error = parse_tool_args(raw_args)
     if parse_error:
@@ -291,6 +294,20 @@ def execute_tool(ctx, name, raw_args):
     problems = validate_args(name, args)
     if problems:
         return err("invalid arguments: " + "; ".join(problems)), {"schema_error": True}
+    if name in INFO_TOOLS:
+        info_seen = True
+    if info_seen and name not in INFO_TOOLS:
+        return err(f"Rejected: '{name}' was batched in the same turn as an information "
+                   f"tool (search/fetch). Read the results first, then call '{name}' "
+                   "in your next turn."), {"schema_error": True}
+    if name == "report" and args.get("status") == "done":
+        missing = [a for a in args.get("artifacts", [])
+                   if not (ctx["workspace"] / a).exists()]
+        if missing:
+            return err(f"Rejected: report claims artifacts that do not exist in the "
+                       f"workspace: {missing}. Write those files first (write_file in "
+                       "their own turn), then report again. If you truly cannot, "
+                       "report with status 'failed' or 'blocked'."), {"schema_error": True}
     if name == "report":
         raise RunComplete(args)
     handler = DISPATCH.get(name)
@@ -316,8 +333,12 @@ def chat(ctx, messages):
     request = urllib.request.Request(
         ctx["endpoint"] + "/v1/chat/completions",
         json.dumps(body).encode(), {"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=300) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:400]
+        raise RuntimeError(f"chat HTTP {e.code}: {detail}") from e
 
 def echo_safe(message):
     """Strip reasoning_content before echoing an assistant message back."""
@@ -333,13 +354,13 @@ def run(args):
     ts = time.strftime("%H%M%S")
     run_id = f"{args.task_id}-{ts}"
     run_dir = Path(args.runs_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
     ctx = {"workspace": run_dir / "workspace", "mail": run_dir / "mail",
            "reasoner_seq": 0, "reasoner_timeout": args.reasoner_timeout,
            "tool_timeout": args.tool_timeout, "endpoint": args.endpoint,
            "model": args.model, "temperature": args.temperature,
            "max_tokens_per_turn": args.max_tokens_per_turn,
            "transcript": (run_dir / "transcript.jsonl").open("w")}
-    ctx["workspace"].mkdir(parents=True, exist_ok=True)
 
     system_prompt = (ROOT / "prompts" / "researcher.md").read_text()
     messages = [{"role": "system", "content": system_prompt},
@@ -385,16 +406,22 @@ def run(args):
                 continue
 
             messages.append(echo_safe(message))
-            finished = False
+            info_seen = False
             for tc in tool_calls:
                 name = tc["function"]["name"]
-                envelope, flags = execute_tool(ctx, name, tc["function"].get("arguments", "{}"))
+                envelope, flags = execute_tool(ctx, name,
+                                               tc["function"].get("arguments", "{}"),
+                                               info_seen=info_seen)
                 stats["tool_calls"] += 1
                 stats["schema_errors"] += int(flags["schema_error"])
                 if envelope.get("ok") is False:
                     stats["tool_errors"] += 1
                     if flags["schema_error"]:
                         stats["repairs"] += 1
+                if envelope.get("ok") and name in INFO_TOOLS:
+                    info_seen = True
+                elif envelope.get("ok") is False and "batched" in str(envelope.get("error", "")):
+                    stats["batch_rejections"] = stats.get("batch_rejections", 0) + 1
                 if name == "ask_reasoner":
                     stats["ask_reasoner"] += 1
                     data = envelope.get("data") or {}
@@ -404,8 +431,16 @@ def run(args):
                                 "ok": envelope.get("ok"), "seconds": envelope.get("_seconds"),
                                 "payload": {k: v for k, v in envelope.items()
                                             if k not in ("_tool", "_seconds")}})
-            if finished:
-                break
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                 "content": json.dumps({k: v for k, v in envelope.items()
+                                                        if not k.startswith("_")})})
+            if stats.get("batch_rejections", 0) and not budget_warned:
+                messages.append({"role": "user", "content":
+                    "RULE VIOLATION this turn. From now on, in every turn call ONLY ONE "
+                    "kind of tool: either information tools (web_search/fetch) OR ONE "
+                    "dependent tool (calc, write_file, or report) that uses values you "
+                    "read from earlier tool results. Never mix the two kinds in one turn."})
+                stats["nudges"] += 1
     except RunComplete as done:
         report, status = done.payload, "done"
     except Exception as e:
