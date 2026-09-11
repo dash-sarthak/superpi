@@ -14,7 +14,7 @@
         packages = [
           llama-cpp-cuda
           pkgs.uv
-          pkgs.sqlite3
+          pkgs.sqlite
           pkgs.jaq
         ];
         shellHook = ''
