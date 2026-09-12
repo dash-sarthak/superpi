@@ -7,6 +7,7 @@ is a uniform envelope, every turn is bounded, every event is transcripted.
 
 import argparse
 import ast
+import hashlib
 import json
 import math
 import re
@@ -412,8 +413,13 @@ class RunComplete(Exception):
 
 INFO_TOOLS = {"web_search", "fetch", "ask_reasoner"}
 EVIDENCE_TOOLS = {"web_search", "fetch", "calc", "read_file", "ask_reasoner"}
+# identical repeats of information tools are pure waste -> hard-block at the
+# third occurrence. Dependent tools are only counted: after a batch rejection
+# the model may legitimately need to re-issue the very call it planned
+# (blocking it deadlocked the smoke run), and the turn budget bounds the damage.
+LOOP_BLOCK_TOOLS = {"web_search", "fetch"}
 
-def execute_tool(ctx, name, raw_args, info_seen=False):
+def execute_tool(ctx, name, raw_args, info_seen=False, timeout=None):
     t0 = time.time()
     args, parse_error = parse_tool_args(raw_args)
     if parse_error:
@@ -445,7 +451,7 @@ def execute_tool(ctx, name, raw_args, info_seen=False):
         return err(f"unknown tool '{name}'"), {"schema_error": True}
     try:
         future = POOL.submit(handler, ctx, args)
-        envelope = future.result(timeout=ctx["tool_timeout"])
+        envelope = future.result(timeout=timeout or ctx["tool_timeout"])
     except RunComplete:
         raise
     except Exception as e:
@@ -655,6 +661,7 @@ def run(args):
     warn_at = max(1, int(args.max_turns * 0.8))
     budget_warned = False
     silent_turns = 0
+    batch_rule_given = False
     recent_calls = []          # normalized "name:args" keys, for loop detection
     streak_errors = 0          # consecutive turns where every tool call failed
     escalated_streak = False
@@ -764,12 +771,20 @@ def run(args):
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
                                  "content": tool_content})
             if stats.get("batch_rejections", 0) and not budget_warned:
+                if not batch_rule_given:
+                    messages.append({"role": "user", "content":
+                        "RULE VIOLATION this turn. From now on, in every turn call ONLY ONE "
+                        "kind of tool: either information tools (web_search/fetch) OR ONE "
+                        "dependent tool (calc, write_file, or report) that uses values you "
+                        "read from earlier tool results. Never mix the two kinds in one turn."})
+                    log_event(ctx, {"type": "batch_rule", "turn": turn})
+                    stats["nudges"] += 1
+                    batch_rule_given = True
+            if dependent_loop_nudge:
                 messages.append({"role": "user", "content":
-                    "RULE VIOLATION this turn. From now on, in every turn call ONLY ONE "
-                    "kind of tool: either information tools (web_search/fetch) OR ONE "
-                    "dependent tool (calc, write_file, or report) that uses values you "
-                    "read from earlier tool results. Never mix the two kinds in one turn."})
-                log_event(ctx, {"type": "batch_rule", "turn": turn})
+                    "You have repeated an identical tool call several times. Repeating "
+                    "the same call cannot make progress. Read the earlier result again, "
+                    "change the arguments, or finish: write your note and call report()."})
                 stats["nudges"] += 1
             # ---- rule-based escalation: the model never self-escalates (phase-1
             # finding), so the harness triggers it on repeated failure.
