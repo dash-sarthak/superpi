@@ -351,18 +351,18 @@ def verify_note(ctx, content):
     if ctx.get("calc_required") and not ctx.get("calc_results"):
         problems.append("this task requires computation: call calc before writing "
                         "the note, and write the value calc returned")
-    return problems, (ctx.get("calc_required") and not ctx.get("calc_results"))
+    return problems
 
 
 def write_note(ctx, path, content):
     """write_file with the phase-2 verification gate in front of it."""
     target = _jailed(ctx, path)
     if ctx.get("verify_notes") and str(path).lower().endswith((".md", ".txt")):
-        problems, calc_starved = verify_note(ctx, str(content))
+        problems = verify_note(ctx, str(content))
         if problems:
             log_event(ctx, {"type": "note_rejected", "path": str(path),
                             "problems": problems})
-            if calc_starved:
+            if ctx.get("calc_required") and not ctx.get("calc_results"):
                 ctx["calc_starved_reject"] = True
             return err("write_file REJECTED by note verification: "
                        + " | ".join(problems))
