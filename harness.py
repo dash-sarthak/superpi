@@ -665,6 +665,7 @@ def run(args):
     silent_turns = 0
     batch_rule_given = False
     calc_starve_nudged = False
+    note_salvage_nudged = False
     recent_calls = []          # normalized "name:args" keys, for loop detection
     streak_errors = 0          # consecutive turns where every tool call failed
     escalated_streak = False
@@ -812,6 +813,16 @@ def run(args):
                     "yourself."})
                 stats["nudges"] += 1
                 calc_starve_nudged = True
+            if stats["note_rejections"] >= 3 and not note_salvage_nudged:
+                messages.append({"role": "user", "content":
+                    "NOTE SALVAGE: your notes have failed verification three times. "
+                    "Stop retrying the same note. Write a minimal note containing ONLY "
+                    "facts you can point to in an actual tool result, with the exact "
+                    "source URL from that result. If a requested fact could not be "
+                    "sourced, write the line 'UNSOURCED: <fact>' for it, then report "
+                    "with status blocked and say which facts are missing."})
+                stats["nudges"] += 1
+                note_salvage_nudged = True
             # ---- rule-based escalation: the model never self-escalates (phase-1
             # finding), so the harness triggers it on repeated failure.
             if turn_err and not turn_ok:
