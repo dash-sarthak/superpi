@@ -1,41 +1,58 @@
 [
   {"id": "t01-tdp-pct",
    "prompt": "Find the thermal design power (TDP) in watts of the Intel Core i7-9850H processor. Then use calc to compute 15% of that value. Write a short note to tdp.md containing: the TDP, the computed 15% value, and the source URL you used.",
-   "expected_keywords": ["45"]},
+   "artifact": "tdp.md", "calc_required": true,
+   "expected_numbers": ["45", "6.75"],
+   "expected_keywords": ["45", "6.75"]},
 
   {"id": "t02-llamacpp-release",
    "prompt": "Find the latest stable release of llama.cpp on GitHub (the ggml-org/llama.cpp repository). Write the release version number, its date, and the release page URL to llama_release.md.",
+   "artifact": "llama_release.md",
    "expected_keywords": ["llama.cppreleases"]},
 
   {"id": "t03-gpu-compare",
    "prompt": "Find how many CUDA cores the NVIDIA Quadro T1000 GPU has. Find how many shader units the PlayStation 5 GPU has. Write a 3-sentence comparison to gpu_compare.md, including both numbers and at least one source URL.",
-   "expected_keywords": ["cuda"]},
+   "artifact": "gpu_compare.md",
+   "expected_numbers": ["896"],
+   "expected_keywords": ["cuda", "896"],
+   "manual_check": "PS5 shader count: sources conflict (1152 vs 2304 by counting method); grade by hand"},
 
   {"id": "t04-searxng-engines",
    "prompt": "Find which search engines SearXNG queries by default for general web results. Name at least three engines and write them with the documentation URL to engines.md.",
+   "artifact": "engines.md",
    "expected_keywords": ["google"]},
 
   {"id": "t05-light-hour",
    "prompt": "Confirm the speed of light in km/s with a web search. Then use calc to compute how far light travels in one hour, in kilometers. Write the constant you used, the computed distance, and the source URL to light.md.",
+   "artifact": "light.md", "calc_required": true,
+   "expected_numbers": ["299792.458", "1079252848.8"],
    "expected_keywords": ["1079252"]},
 
   {"id": "t06-world-pop",
    "prompt": "Find the current estimated world population and the year the UN projects it to reach 10 billion. Write both facts with their source URL to pop.md.",
+   "artifact": "pop.md",
    "expected_keywords": ["billion"]},
 
   {"id": "t07-llamacpp-slots",
    "prompt": "Find the llama.cpp llama-server documentation about running multiple parallel requests (the --parallel / -np option). Write 3 sentences to slots.md: what the option does, its default value, and one caveat about context or memory. Include the doc URL.",
+   "artifact": "slots.md",
    "expected_keywords": ["parallel"]},
 
   {"id": "t08-gil-status",
    "prompt": "Research the current status of removing Python's GIL (global interpreter lock): is free-threaded Python official in the latest Python releases? Write 2-3 sentences with the PEP number(s) and a source URL to gil.md.",
-   "expected_keywords": ["pep"]},
+   "artifact": "gil.md",
+   "expected_numbers": ["703"],
+   "expected_keywords": ["703"]},
 
   {"id": "t09-moon-fall",
    "prompt": "Confirm the Moon's surface gravity (about 1.62 m/s^2) with a web search. Then use calc to compute how many seconds an object takes to fall 10 meters on the Moon, using t = sqrt(2*h/g) with h=10 and g=1.62. Write the gravity value, the computed time (about 3.5 seconds, include precise digits), and the source URL to moon.md.",
+   "artifact": "moon.md", "calc_required": true,
+   "expected_numbers": ["3.5136"],
    "expected_keywords": ["3.51"]},
 
   {"id": "t10-lhc-date",
    "prompt": "Find the year CERN's Large Hadron Collider first circulated proton beams, and the month if available. Write the date with a source URL to lhc.md.",
+   "artifact": "lhc.md",
+   "expected_numbers": ["2008"],
    "expected_keywords": ["2008"]}
 ]

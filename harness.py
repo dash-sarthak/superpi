@@ -11,6 +11,7 @@ import json
 import math
 import re
 import socket
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -247,6 +248,131 @@ def list_dir(ctx):
                    for p in ctx["workspace"].rglob("*") if p.is_file())
     return ok(items or "workspace is empty")
 
+# ---------------------------------------------------------------- note verification
+# Deterministic phase-2 verification layer. The model may only write numbers it
+# read from a tool result (search snippet, fetched page, calc, file read, or the
+# task prompt itself) and URLs it actually searched or fetched. Everything here
+# is string/number matching over recorded evidence: no extra model calls.
+
+NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
+# a line that looks like "<digits> <op> <digits> ... = <digits>": the signature
+# of arithmetic done in text instead of via calc.
+ARITH_RESULT_RE = re.compile(
+    r"^.*\d\s*[+\-*/x×÷^]\s*\d.*=\s*([\d,]+(?:\.\d+)?)", re.M)
+
+
+def _cited_urls(content):
+    """URLs in a note, with sentence punctuation stripped from the tail."""
+    return [u.rstrip(".,;:!?") for u in URL_RE.findall(content)]
+
+
+def _matches_any(value, values, tol=0.005):
+    """Exact for integer pairs; small relative tolerance when floats involved."""
+    for w in values:
+        if value == w:
+            return True
+        if not (value.is_integer() and w.is_integer()):
+            scale = max(abs(value), abs(w))
+            if scale and abs(value - w) <= scale * tol:
+                return True
+    return False
+
+
+def _norm_num(s):
+    return s.replace(",", "").strip()
+
+
+def _number_tokens(blob):
+    return {_norm_num(m) for m in NUM_RE.findall(blob)}
+
+
+def _number_sourced(num, token_set, values):
+    """num is a normalized numeric string; values the floats seen in evidence.
+    Integers must match exactly (years, counts: no tolerance, fabrication of
+    "888" vs "896" or year drift must fail). Floats get a 0.5% relative
+    tolerance so rounded calc results (3.5 from 3.5136...) count as sourced."""
+    if num in token_set:
+        return True
+    try:
+        v = float(num)
+    except ValueError:
+        return True  # not a plain number; other rules apply
+    if v.is_integer() and 0 <= v < 10:
+        return True  # small integers are noise; stoplisted
+    for w in values:
+        if v == w:
+            return True
+        if not (v.is_integer() and w.is_integer()):
+            scale = max(abs(v), abs(w))
+            if scale and abs(v - w) <= scale * 0.005:
+                return True
+    return False
+
+
+def verify_note(ctx, content):
+    """Return a list of human-readable problems; empty list means the note is
+    fully sourced. Called on every .md/.txt write when verification is on."""
+    problems = []
+    blob = "\n".join(ctx["evidence"]).lower()
+    token_set = _number_tokens(blob)
+    values = [float(t) for t in token_set if re.fullmatch(r"\d+(?:\.\d+)?", t)]
+    values += [v for _, v in ctx.get("calc_results", [])]  # calc outputs are evidence
+
+    unsourced = sorted({_norm_num(m) for m in NUM_RE.findall(content)
+                        if not _number_sourced(_norm_num(m), token_set, values)})
+    if unsourced:
+        problems.append("these numbers appear in NO tool result (search snippet, "
+                        "fetched page, calc, or the task text), so you must not "
+                        "write them: " + ", ".join(unsourced[:8]) +
+                        ". Verify each via web_search/fetch, or compute via calc, "
+                        "then write again with only sourced numbers")
+
+    missing_urls = [u for u in dict.fromkeys(_cited_urls(content))
+                    if u.lower() not in blob]
+    if missing_urls:
+        problems.append("these URLs were never returned by a search or fetched by "
+                        "you: " + ", ".join(missing_urls[:5]) +
+                        ". Cite only URLs that appeared in a tool result")
+
+    for m in ARITH_RESULT_RE.finditer(content):
+        rhs = _norm_num(m.group(1))
+        try:
+            v = float(rhs)
+        except ValueError:
+            continue
+        if not _matches_any(v, [w for _, w in ctx.get("calc_results", [])]):
+            problems.append(f"your note contains in-text arithmetic with result "
+                            f"'{rhs}' but no calc call produced that value. All "
+                            "arithmetic must go through calc; cite the calc output")
+            break  # one finding is enough to force a rewrite
+
+    if ctx.get("calc_required") and not ctx.get("calc_results"):
+        problems.append("this task requires computation: call calc before writing "
+                        "the note, and write the value calc returned")
+    return problems
+
+
+def write_note(ctx, path, content):
+    """write_file with the phase-2 verification gate in front of it."""
+    target = _jailed(ctx, path)
+    if ctx.get("verify_notes") and str(path).lower().endswith((".md", ".txt")):
+        problems = verify_note(ctx, str(content))
+        if problems:
+            log_event(ctx, {"type": "note_rejected", "path": str(path),
+                            "problems": problems})
+            return err("write_file REJECTED by note verification: "
+                       + " | ".join(problems))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(str(content))
+    return ok(f"wrote {len(str(content))} bytes to {path}")
+
+
+def calc_tool(ctx, expr):
+    value = calc(expr)
+    ctx.setdefault("calc_results", []).append((expr, value))
+    return value
+
 # ---------------------------------------------------------------- ask_reasoner
 
 def ask_reasoner(ctx, question, context=""):
@@ -273,9 +399,9 @@ def ask_reasoner(ctx, question, context=""):
 DISPATCH = {
     "web_search": lambda ctx, a: web_search(a["query"]),
     "fetch": lambda ctx, a: fetch(a["url"]),
-    "calc": lambda ctx, a: ok(calc(a["expr"])),
+    "calc": lambda ctx, a: ok(calc_tool(ctx, a["expr"])),
     "read_file": lambda ctx, a: read_file(ctx, a["path"]),
-    "write_file": lambda ctx, a: write_file(ctx, a["path"], a["content"]),
+    "write_file": lambda ctx, a: write_note(ctx, a["path"], a["content"]),
     "list_dir": lambda ctx, a: list_dir(ctx),
     "ask_reasoner": lambda ctx, a: ask_reasoner(ctx, a["question"], a.get("context", "")),
 }
@@ -285,6 +411,7 @@ class RunComplete(Exception):
         self.payload = payload
 
 INFO_TOOLS = {"web_search", "fetch", "ask_reasoner"}
+EVIDENCE_TOOLS = {"web_search", "fetch", "calc", "read_file", "ask_reasoner"}
 
 def execute_tool(ctx, name, raw_args, info_seen=False):
     t0 = time.time()
@@ -301,13 +428,16 @@ def execute_tool(ctx, name, raw_args, info_seen=False):
                    f"tool (search/fetch). Read the results first, then call '{name}' "
                    "in your next turn."), {"schema_error": True}
     if name == "report" and args.get("status") == "done":
-        missing = [a for a in args.get("artifacts", [])
-                   if not (ctx["workspace"] / a).exists()]
+        claimed = args.get("artifacts") or []
+        missing = [a for a in claimed if not (ctx["workspace"] / a).exists()]
+        for req in ctx.get("required_artifacts", []):
+            if req not in missing and not (ctx["workspace"] / req).exists():
+                missing.append(req)
         if missing:
-            return err(f"Rejected: report claims artifacts that do not exist in the "
-                       f"workspace: {missing}. Write those files first (write_file in "
-                       "their own turn), then report again. If you truly cannot, "
-                       "report with status 'failed' or 'blocked'."), {"schema_error": True}
+            return err(f"Rejected: these artifacts do not exist in the workspace: "
+                       f"{missing}. Write those files first (write_file in their own "
+                       "turn), then report again. If you truly cannot, report with "
+                       "status 'failed' or 'blocked'."), {"schema_error": True}
     if name == "report":
         raise RunComplete(args)
     handler = DISPATCH.get(name)
@@ -340,20 +470,118 @@ def chat(ctx, messages):
         detail = e.read().decode(errors="replace")[:400]
         if e.code == 500 and "parse tool call" in detail:
             raise ToolCallParseError(detail) from e
+        if e.code == 400 and ("context" in detail.lower() or "exceed" in detail.lower()):
+            raise ContextOverflow(detail) from e
         raise RuntimeError(f"chat HTTP {e.code}: {detail}") from e
 
 class ToolCallParseError(RuntimeError):
+    pass
+
+class ContextOverflow(RuntimeError):
     pass
 
 def echo_safe(message):
     """Strip reasoning_content before echoing an assistant message back."""
     return {k: v for k, v in message.items() if k != "reasoning_content"}
 
+# ---------------------------------------------------------------- compaction & convergence
+
+def compact_messages(messages, keep_recent=6):
+    """Drop old turns when the prompt exceeds the server context. Groups stay
+    intact (an assistant with tool_calls is never separated from its tool
+    replies, or the OpenAI protocol breaks). Elided turns leave one short
+    assistant breadcrumb so the model keeps its bearings. Deterministic."""
+    head, rest = messages[:2], messages[2:]  # system + task prompt
+    groups, i = [], 0
+    while i < len(rest):
+        m = rest[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            while j < len(rest) and rest[j].get("role") == "tool":
+                j += 1
+            groups.append(rest[i:j])
+            i = j
+        else:
+            groups.append([m])
+            i += 1
+    keep = groups[-keep_recent:]
+    dropped = groups[:-keep_recent]
+    trail = []
+    for g in dropped:
+        a = g[0]
+        if a.get("role") == "assistant":
+            names = [tc.get("function", {}).get("name") for tc in (a.get("tool_calls") or [])]
+            label = f"[elided earlier turn: called {', '.join(n for n in names if n)}]" if names \
+                else f"[elided earlier turn: {str(a.get('content') or '')[:150]}]"
+            trail.append({"role": "assistant", "content": label})
+    return head + trail + [m for g in keep for m in g]
+
+def artifacts_on_disk(ctx):
+    """Required artifacts that actually exist in the workspace."""
+    return [a for a in ctx.get("required_artifacts", [])
+            if (ctx["workspace"] / a).exists()]
+
+def assisted_report(ctx):
+    """Compose the report the model refused to write: collect what is on disk.
+    Marks itself honestly via harness_assisted=True for grading."""
+    arts = artifacts_on_disk(ctx)
+    if not arts:
+        arts = sorted(p.relative_to(ctx["workspace"]).as_posix()
+                      for p in ctx["workspace"].rglob("*") if p.is_file())[:3]
+    parts = []
+    for a in arts:
+        try:
+            parts.append(f"{a}: {(ctx["workspace"] / a).read_text()[:400]}")
+        except Exception:
+            pass
+    return {"status": "done",
+            "summary": "HARNESS-ASSISTED REPORT: the model stopped using tools, so "
+                       "the harness collected existing artifacts. " + " | ".join(parts)[:1200],
+            "artifacts": arts, "harness_assisted": True}
+
+# ---------------------------------------------------------------- activity db
+
+def open_activity_db(runs_dir):
+    """One events table for the whole project; the observer/doctor read it.
+    Any failure here degrades to no-op: logging must never kill a run."""
+    try:
+        Path(runs_dir).mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(Path(runs_dir) / "activity.db")
+        conn.execute("""CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL, run_id TEXT, task_id TEXT, model TEXT,
+            turn INTEGER, type TEXT, tool TEXT, ok INTEGER,
+            seconds REAL, meta TEXT)""")
+        conn.commit()
+        return conn
+    except Exception:
+        return None
+
+def db_event(ctx, event):
+    conn = ctx.get("db")
+    if conn is None:
+        return
+    try:
+        ok = event.get("ok")
+        conn.execute(
+            "INSERT INTO events (ts, run_id, task_id, model, turn, type, tool, "
+            "ok, seconds, meta) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), ctx.get("run_id"), ctx.get("task_id"), ctx.get("model"),
+             event.get("turn"), event.get("type"), event.get("tool"),
+             None if ok is None else int(bool(ok)), event.get("seconds"),
+             json.dumps(event, default=str)[:4000]))
+        conn.commit()
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------- main loop
 
 def log_event(ctx, event):
-    ctx["transcript"].write(json.dumps(event, default=str) + "\n")
-    ctx["transcript"].flush()
+    transcript = ctx.get("transcript")
+    if transcript is not None:
+        transcript.write(json.dumps(event, default=str) + "\n")
+        transcript.flush()
+    db_event(ctx, event)
 
 def run(args):
     ts = time.strftime("%H%M%S")
@@ -365,6 +593,12 @@ def run(args):
            "tool_timeout": args.tool_timeout, "endpoint": args.endpoint,
            "model": args.model, "temperature": args.temperature,
            "max_tokens_per_turn": args.max_tokens_per_turn,
+           "verify_notes": not args.no_verify_notes,
+           "calc_required": args.calc_required,
+           "required_artifacts": list(args.artifact),
+           "evidence": [args.prompt], "calc_results": [],
+           "run_id": run_id, "task_id": args.task_id, "runs_dir": args.runs_dir,
+           "db": open_activity_db(args.runs_dir),
            "transcript": (run_dir / "transcript.jsonl").open("w")}
 
     system_prompt = (ROOT / "prompts" / "researcher.md").read_text()
@@ -376,21 +610,47 @@ def run(args):
 
     stats = {"prompt_tokens": 0, "completion_tokens": 0, "tool_calls": 0,
              "tool_errors": 0, "schema_errors": 0, "repairs": 0,
-             "ask_reasoner": 0, "reasoner_timeout": 0, "nudges": 0}
+             "ask_reasoner": 0, "reasoner_timeout": 0, "nudges": 0,
+             "escalations": 0, "loop_incidents": 0, "tokens_meta": 0,
+             "note_rejections": 0}
     report, status, t0 = None, "no_report", time.time()
     warn_at = max(1, int(args.max_turns * 0.8))
     budget_warned = False
+    silent_turns = 0
+    recent_calls = []          # normalized "name:args" keys, for loop detection
+    streak_errors = 0          # consecutive turns where every tool call failed
+    escalated_streak = False
 
     try:
         for turn in range(args.max_turns):
             if turn == warn_at and not budget_warned:
+                hint = ctx["required_artifacts"][0] if ctx["required_artifacts"] \
+                    else "the requested file"
                 messages.append({"role": "user", "content":
-                    "BUDGET WARNING: turns are almost exhausted. Wrap up now: "
-                    "either finish via report(), or call ask_reasoner if truly stuck."})
+                    f"BUDGET WARNING: turns are almost exhausted. Wrap up NOW: write "
+                    f"what you have to {hint} via write_file, then call report() with "
+                    "status done. If truly stuck, call ask_reasoner once."})
+                log_event(ctx, {"type": "budget_warning", "turn": turn})
                 stats["nudges"] += 1
                 budget_warned = True
             try:
                 response = chat(ctx, messages)
+            except ContextOverflow:
+                keep = 6
+                while True:
+                    stats["compactions"] = stats.get("compactions", 0) + 1
+                    log_event(ctx, {"type": "context_compaction", "turn": turn,
+                                    "messages_before": len(messages), "keep": keep})
+                    messages = compact_messages(messages, keep_recent=keep)
+                    log_event(ctx, {"type": "context_compacted",
+                                    "messages_after": len(messages)})
+                    try:
+                        response = chat(ctx, messages)
+                        break
+                    except ContextOverflow:
+                        if keep <= 2:
+                            raise
+                        keep -= 2
             except ToolCallParseError:
                 stats["server_parse_recoveries"] = stats.get("server_parse_recoveries", 0) + 1
                 log_event(ctx, {"type": "server_parse_error", "turn": turn})
@@ -409,6 +669,14 @@ def run(args):
                             "tool_calls": [tc.get("function") for tc in tool_calls]})
 
             if not tool_calls:
+                stats["tokens_meta"] += usage.get("completion_tokens", 0)
+                silent_turns += 1
+                # forced convergence: model went tool-silent but the work product
+                # exists -> harness writes the report it refused to write
+                if silent_turns >= 2 and artifacts_on_disk(ctx):
+                    log_event(ctx, {"type": "assisted_report",
+                                    "reason": "tool_silent", "turn": turn})
+                    raise RunComplete(assisted_report(ctx))
                 if turn == args.max_turns - 1:
                     status = "no_report"
                     break
@@ -418,19 +686,42 @@ def run(args):
                 stats["nudges"] += 1
                 continue
 
+            silent_turns = 0
             messages.append(echo_safe(message))
             info_seen = False
+            turn_ok, turn_err = 0, 0
             for tc in tool_calls:
                 name = tc["function"]["name"]
-                envelope, flags = execute_tool(ctx, name,
-                                               tc["function"].get("arguments", "{}"),
-                                               info_seen=info_seen)
+                # ---- loop detection: block the third identical call
+                raw = tc["function"].get("arguments", "{}")
+                try:
+                    a, _ = parse_tool_args(raw)
+                    key = name + ":" + json.dumps(a, sort_keys=True, default=str)[:400]
+                except Exception:
+                    key = name + ":" + str(raw)[:200]
+                if recent_calls.count(key) >= 2:
+                    stats["loop_incidents"] += 1
+                    log_event(ctx, {"type": "loop_suspected", "turn": turn,
+                                    "tool": name, "occurrences": recent_calls.count(key) + 1})
+                    envelope = err("Rejected: you have already made this exact call "
+                                   "twice before. Repeating identical calls wastes your "
+                                   "turn budget. Change the arguments, use a different "
+                                   "tool, or write what you have and report.")
+                    envelope["_tool"] = name
+                    flags = {"schema_error": False}
+                else:
+                    recent_calls.append(key)
+                    envelope, flags = execute_tool(ctx, name, raw,
+                                                   info_seen=info_seen)
                 stats["tool_calls"] += 1
                 stats["schema_errors"] += int(flags["schema_error"])
                 if envelope.get("ok") is False:
                     stats["tool_errors"] += 1
+                    turn_err += 1
                     if flags["schema_error"]:
                         stats["repairs"] += 1
+                else:
+                    turn_ok += 1
                 if envelope.get("ok") and name in INFO_TOOLS:
                     info_seen = True
                 elif envelope.get("ok") is False and "batched" in str(envelope.get("error", "")):
@@ -440,33 +731,68 @@ def run(args):
                     data = envelope.get("data") or {}
                     if "did not answer" in str(data.get("note", "")):
                         stats["reasoner_timeout"] += 1
+                if (name == "write_file" and envelope.get("ok") is False
+                        and "note verification" in str(envelope.get("error", ""))):
+                    stats["note_rejections"] += 1
                 log_event(ctx, {"type": "tool_result", "turn": turn, "tool": name,
                                 "ok": envelope.get("ok"), "seconds": envelope.get("_seconds"),
                                 "payload": {k: v for k, v in envelope.items()
                                             if k not in ("_tool", "_seconds")}})
+                tool_content = json.dumps({k: v for k, v in envelope.items()
+                                           if not k.startswith("_")})
+                if envelope.get("ok") and name in EVIDENCE_TOOLS:
+                    ctx["evidence"].append(tool_content)
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
-                                 "content": json.dumps({k: v for k, v in envelope.items()
-                                                        if not k.startswith("_")})})
+                                 "content": tool_content})
             if stats.get("batch_rejections", 0) and not budget_warned:
                 messages.append({"role": "user", "content":
                     "RULE VIOLATION this turn. From now on, in every turn call ONLY ONE "
                     "kind of tool: either information tools (web_search/fetch) OR ONE "
                     "dependent tool (calc, write_file, or report) that uses values you "
                     "read from earlier tool results. Never mix the two kinds in one turn."})
+                log_event(ctx, {"type": "batch_rule", "turn": turn})
                 stats["nudges"] += 1
+            # ---- rule-based escalation: the model never self-escalates (phase-1
+            # finding), so the harness triggers it on repeated failure.
+            if turn_err and not turn_ok:
+                streak_errors += 1
+            else:
+                streak_errors = 0
+                escalated_streak = False
+            if streak_errors >= 2 and not escalated_streak and not budget_warned:
+                messages.append({"role": "user", "content":
+                    "HARNESS ESCALATION: two or more consecutive tool calls failed. "
+                    "Do not keep retrying the same approach. Call ask_reasoner now "
+                    "with a precise question and what you tried. If the reasoner does "
+                    "not answer, change approach or report with status 'blocked'."})
+                log_event(ctx, {"type": "harness_escalation", "turn": turn,
+                                "streak": streak_errors})
+                stats["escalations"] += 1
+                escalated_streak = True
     except RunComplete as done:
         report, status = done.payload, "done"
+    except ContextOverflow as e:
+        status = "context_overflow"
+        log_event(ctx, {"type": "context_overflow_fatal", "error": str(e)[:200]})
     except Exception as e:
         status = "crash"
         log_event(ctx, {"type": "crash", "error": f"{type(e).__name__}: {e}"})
     finally:
+        # budget exhausted without a report: salvage what reached the disk
+        if status == "no_report" and artifacts_on_disk(ctx):
+            log_event(ctx, {"type": "assisted_report", "reason": "budget_exhausted"})
+            report = assisted_report(ctx)
+            status = "done"
         wall = time.time() - t0
         result = {"run_id": run_id, "task_id": args.task_id, "status": status,
                   "turns": turn + 1 if "turn" in dir() else 0, "wall_seconds": round(wall, 1),
-                  "report": report, **stats}
+                  "report": report,
+                  "assisted": bool((report or {}).get("harness_assisted")), **stats}
         (run_dir / "result.json").write_text(json.dumps(result, indent=2, default=str))
         log_event(ctx, {"type": "run_end", "status": status, "wall": wall})
         ctx["transcript"].close()
+        if ctx.get("db") is not None:
+            ctx["db"].close()
         print(f"[harness] run {run_id}: {status} in {wall:.0f}s, "
               f"{stats['tool_calls']} tool calls, {stats['completion_tokens']} tokens out",
               flush=True)
@@ -484,6 +810,12 @@ def main():
     p.add_argument("--tool-timeout", type=int, default=30)
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--runs-dir", default="runs")
+    p.add_argument("--artifact", action="append", default=[],
+                   help="required artifact file; report(done) is rejected until it exists")
+    p.add_argument("--calc-required", action="store_true",
+                   help="reject note writes until at least one calc call succeeded")
+    p.add_argument("--no-verify-notes", action="store_true",
+                   help="disable deterministic note verification (A/B mode)")
     run(p.parse_args())
 
 if __name__ == "__main__":
