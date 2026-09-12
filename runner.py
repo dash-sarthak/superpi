@@ -121,6 +121,8 @@ def run_once(task, args, runs_root, run_index):
     g = grade(task, run_dir)
     row = {"task_id": task["id"], "run": run_index,
            "status": result.get("status", "missing"),
+           "task_status": ((result.get("report") or {}).get("status")
+                           or result.get("status", "missing")),
            "assisted": result.get("assisted", False),
            "turns": result.get("turns"), "wall": result.get("wall_seconds"),
            "tokens_out": result.get("completion_tokens"),
@@ -143,7 +145,7 @@ def run_once(task, args, runs_root, run_index):
 
 def aggregate(per_runs, task, n):
     """Majority vote across the N runs of one task."""
-    statuses = [r["status"] for r in per_runs]
+    statuses = [r["task_status"] for r in per_runs]
     done = sum(1 for s in statuses if s == "done")
     correct = sum(1 for r in per_runs if r.get("likely_correct"))
     assisted = sum(1 for r in per_runs if r.get("assisted"))
@@ -225,7 +227,7 @@ def main():
                   f"{str(r['note_rejections']):>4} {str(r['loop_incidents']):>4} "
                   f"{str(r['escalations']):>3} {str(r['compactions']):>3} "
                   f"{str(r['ask_reasoner']):>4} {str(r['likely_correct']):>5}")
-    done = sum(1 for r in all_rows if r["status"] == "done")
+    done = sum(1 for r in all_rows if r["task_status"] == "done")
     correct_rows = agg_rows if args.runs > 1 else all_rows
     correct = sum(1 for r in correct_rows if r.get("likely_correct"))
     total = len(agg_rows) if args.runs > 1 else len(all_rows)

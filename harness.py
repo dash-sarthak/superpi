@@ -351,17 +351,19 @@ def verify_note(ctx, content):
     if ctx.get("calc_required") and not ctx.get("calc_results"):
         problems.append("this task requires computation: call calc before writing "
                         "the note, and write the value calc returned")
-    return problems
+    return problems, (ctx.get("calc_required") and not ctx.get("calc_results"))
 
 
 def write_note(ctx, path, content):
     """write_file with the phase-2 verification gate in front of it."""
     target = _jailed(ctx, path)
     if ctx.get("verify_notes") and str(path).lower().endswith((".md", ".txt")):
-        problems = verify_note(ctx, str(content))
+        problems, calc_starved = verify_note(ctx, str(content))
         if problems:
             log_event(ctx, {"type": "note_rejected", "path": str(path),
                             "problems": problems})
+            if calc_starved:
+                ctx["calc_starved_reject"] = True
             return err("write_file REJECTED by note verification: "
                        + " | ".join(problems))
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -662,6 +664,7 @@ def run(args):
     budget_warned = False
     silent_turns = 0
     batch_rule_given = False
+    calc_starve_nudged = False
     recent_calls = []          # normalized "name:args" keys, for loop detection
     streak_errors = 0          # consecutive turns where every tool call failed
     escalated_streak = False
@@ -799,6 +802,16 @@ def run(args):
                     "the same call cannot make progress. Read the earlier result again, "
                     "change the arguments, or finish: write your note and call report()."})
                 stats["nudges"] += 1
+            if ctx.pop("calc_starved_reject", False) and not calc_starve_nudged:
+                messages.append({"role": "user", "content":
+                    "Your note was rejected because NO calc call has succeeded in this "
+                    "task yet, and this task requires computation. In your NEXT turn, "
+                    "call calc ALONE with the full expression (for example calc with "
+                    "expr set to the formula and numbers you need). Then write the note "
+                    "using exactly the number calc returned — not a number you computed "
+                    "yourself."})
+                stats["nudges"] += 1
+                calc_starve_nudged = True
             # ---- rule-based escalation: the model never self-escalates (phase-1
             # finding), so the harness triggers it on repeated failure.
             if turn_err and not turn_ok:
