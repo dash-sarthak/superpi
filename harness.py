@@ -716,19 +716,23 @@ def run(args):
             messages.append(echo_safe(message))
             info_seen = False
             turn_ok, turn_err = 0, 0
+            dependent_loop_nudge = False
             for tc in tool_calls:
                 name = tc["function"]["name"]
-                # ---- loop detection: block the third identical call
+                # ---- loop detection: full-fidelity key, info tools hard-blocked
                 raw = tc["function"].get("arguments", "{}")
                 try:
                     a, _ = parse_tool_args(raw)
-                    key = name + ":" + json.dumps(a, sort_keys=True, default=str)[:400]
+                    args_json = json.dumps(a, sort_keys=True, default=str)
                 except Exception:
-                    key = name + ":" + str(raw)[:200]
-                if recent_calls.count(key) >= 2:
+                    args_json = str(raw)[:2000]
+                key = name + ":" + hashlib.sha256(args_json.encode()).hexdigest()[:16]
+                seen = recent_calls.count(key)
+                recent_calls.append(key)
+                if seen >= 2 and name in LOOP_BLOCK_TOOLS:
                     stats["loop_incidents"] += 1
                     log_event(ctx, {"type": "loop_suspected", "turn": turn,
-                                    "tool": name, "occurrences": recent_calls.count(key) + 1})
+                                    "tool": name, "occurrences": seen + 1})
                     envelope = err("Rejected: you have already made this exact call "
                                    "twice before. Repeating identical calls wastes your "
                                    "turn budget. Change the arguments, use a different "
@@ -736,9 +740,18 @@ def run(args):
                     envelope["_tool"] = name
                     flags = {"schema_error": False}
                 else:
-                    recent_calls.append(key)
+                    if seen >= 2:
+                        stats["loop_incidents"] += 1
+                        if seen >= 3:
+                            dependent_loop_nudge = True
+                        log_event(ctx, {"type": "loop_suspected", "turn": turn,
+                                        "tool": name, "occurrences": seen + 1,
+                                        "soft": True})
+                    timeout = (ctx["reasoner_timeout"] + 15
+                               if name == "ask_reasoner" else None)
                     envelope, flags = execute_tool(ctx, name, raw,
-                                                   info_seen=info_seen)
+                                                   info_seen=info_seen,
+                                                   timeout=timeout)
                 stats["tool_calls"] += 1
                 stats["schema_errors"] += int(flags["schema_error"])
                 if envelope.get("ok") is False:
