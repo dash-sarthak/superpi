@@ -185,23 +185,24 @@ def test_runner_grading():
     check("comma-grouped floats pass", runner.grade(t5, rd)["likely_correct"])
 
     agg = runner.aggregate(
-        [{"status": "done", "likely_correct": True, "assisted": False,
+        [{"status": "done", "task_status": "done", "likely_correct": True, "assisted": False,
           "keywords_missing": [], "numbers_missing": [], "bench_wall": 10},
-         {"status": "done", "likely_correct": False, "assisted": False,
+         {"status": "done", "task_status": "done", "likely_correct": False, "assisted": False,
           "keywords_missing": ["x"], "numbers_missing": [], "bench_wall": 10},
-         {"status": "no_report", "likely_correct": False, "assisted": True,
+         {"status": "no_report", "task_status": "blocked", "likely_correct": False, "assisted": True,
           "keywords_missing": ["x"], "numbers_missing": ["y"], "bench_wall": 10}],
         task, 3)
     check("majority vote 1/3 -> incorrect", agg["likely_correct"] is False)
     agg2 = runner.aggregate(
-        [{"status": "done", "likely_correct": True, "assisted": False,
+        [{"status": "done", "task_status": "done", "likely_correct": True, "assisted": False,
           "keywords_missing": [], "numbers_missing": [], "bench_wall": 10},
-         {"status": "done", "likely_correct": True, "assisted": False,
+         {"status": "done", "task_status": "done", "likely_correct": True, "assisted": False,
           "keywords_missing": [], "numbers_missing": [], "bench_wall": 10},
-         {"status": "done", "likely_correct": False, "assisted": False,
+         {"status": "done", "task_status": "blocked", "likely_correct": False, "assisted": False,
           "keywords_missing": ["x"], "numbers_missing": [], "bench_wall": 10}],
         task, 3)
     check("majority vote 2/3 -> correct", agg2["likely_correct"] is True)
+    check("blocked report does not count as done", agg["done_runs"] == 2)
 
 
 # --------------------------------------------------------------- activity db
