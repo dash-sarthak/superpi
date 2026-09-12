@@ -480,6 +480,44 @@ class ToolCallParseError(RuntimeError):
 class ContextOverflow(RuntimeError):
     pass
 
+def chat_with_recovery(ctx, messages, stats, turn):
+    """chat() with bounded recovery: server-parse errors get a 'repeat it
+    smaller' nudge, context overflow gets transcript compaction, transient
+    5xx (grammar stack, slot OOM) get retries with backoff. Returns the
+    response, or None when the server is unusable this turn."""
+    for attempt in range(3):
+        try:
+            return chat(ctx, messages)
+        except ToolCallParseError:
+            stats["server_parse_recoveries"] = stats.get("server_parse_recoveries", 0) + 1
+            log_event(ctx, {"type": "server_parse_error", "turn": turn,
+                            "attempt": attempt})
+            messages.append({"role": "user", "content":
+                "Your previous tool call was malformed or truncated (too long). "
+                "Repeat it smaller and simpler: shorter content, one call only."})
+        except ContextOverflow:
+            keep = 6
+            while True:
+                stats["compactions"] = stats.get("compactions", 0) + 1
+                log_event(ctx, {"type": "context_compaction", "turn": turn,
+                                "messages_before": len(messages), "keep": keep})
+                messages = compact_messages(messages, keep_recent=keep)
+                log_event(ctx, {"type": "context_compacted",
+                                "messages_after": len(messages)})
+                try:
+                    return chat(ctx, messages)
+                except ContextOverflow:
+                    if keep <= 2:
+                        raise
+                    keep -= 2
+        except RuntimeError as e:
+            stats["server_retries"] = stats.get("server_retries", 0) + 1
+            log_event(ctx, {"type": "server_retry", "turn": turn,
+                            "attempt": attempt, "error": str(e)[:200]})
+            time.sleep(2 * (attempt + 1))
+    log_event(ctx, {"type": "server_gave_up", "turn": turn})
+    return None
+
 def echo_safe(message):
     """Strip reasoning_content before echoing an assistant message back."""
     return {k: v for k, v in message.items() if k != "reasoning_content"}
@@ -633,31 +671,12 @@ def run(args):
                 log_event(ctx, {"type": "budget_warning", "turn": turn})
                 stats["nudges"] += 1
                 budget_warned = True
-            try:
-                response = chat(ctx, messages)
-            except ContextOverflow:
-                keep = 6
-                while True:
-                    stats["compactions"] = stats.get("compactions", 0) + 1
-                    log_event(ctx, {"type": "context_compaction", "turn": turn,
-                                    "messages_before": len(messages), "keep": keep})
-                    messages = compact_messages(messages, keep_recent=keep)
-                    log_event(ctx, {"type": "context_compacted",
-                                    "messages_after": len(messages)})
-                    try:
-                        response = chat(ctx, messages)
-                        break
-                    except ContextOverflow:
-                        if keep <= 2:
-                            raise
-                        keep -= 2
-            except ToolCallParseError:
-                stats["server_parse_recoveries"] = stats.get("server_parse_recoveries", 0) + 1
-                log_event(ctx, {"type": "server_parse_error", "turn": turn})
-                messages.append({"role": "user", "content":
-                    "Your previous tool call was malformed or truncated (too long). "
-                    "Repeat it smaller and simpler: shorter content, one call only."})
-                response = chat(ctx, messages)
+            response = chat_with_recovery(ctx, messages, stats, turn)
+            if response is None:
+                status = "server_error"
+                log_event(ctx, {"type": "crash", "error": "server unusable after "
+                                "3 attempts with recovery"})
+                break
             usage = response.get("usage", {})
             stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
             stats["completion_tokens"] += usage.get("completion_tokens", 0)
